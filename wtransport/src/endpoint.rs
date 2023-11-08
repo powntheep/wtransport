@@ -403,6 +403,168 @@ impl Endpoint<endpoint_side::Client> {
 
         Ok(Connection::new(quic_connection, driver, session_id))
     }
+
+    /// Establishes a WebTransport connection to a specified URL.
+    ///
+    /// This method initiates a WebTransport connection to the specified URL.
+    /// It validates the URL, and performs necessary steps to establish a secure connection.
+    ///
+    /// # Arguments
+    ///
+    /// * `url` - A [URL](https://en.wikipedia.org/wiki/URL) string representing the WebTransport
+    ///           endpoint to connect to. It must have an `https` scheme.
+    ///           The URL can specify either an IP address or a hostname.
+    ///           When specifying a hostname, the method will internally perform DNS resolution,
+    ///           configured with
+    ///           [`ClientConfigBuilder::dns_resolver`](crate::config::ClientConfigBuilder::dns_resolver).
+    /// * `authorization` - A string representing the authorization header value.
+    pub async fn connect_with_authorization<S, T>(
+        &self,
+        url: S,
+        authorization: T,
+    ) -> Result<Connection, ConnectingError>
+    where
+        S: AsRef<str>,
+        T: ToString,
+    {
+        let url = Url::parse(url.as_ref())
+            .map_err(|parse_error| ConnectingError::InvalidUrl(parse_error.to_string()))?;
+
+        if url.scheme() != "https" {
+            return Err(ConnectingError::InvalidUrl(
+                "WebTransport URL scheme must be 'https'".to_string(),
+            ));
+        }
+
+        let host = url.host().expect("https scheme must have an host");
+        let port = url.port().unwrap_or(443);
+
+        let (socket_address, server_name) = match host {
+            Host::Domain(domain) => {
+                let socket_address = self
+                    .side
+                    .dns_resolver
+                    .resolve(&format!("{domain}:{port}"))
+                    .await
+                    .map_err(ConnectingError::DnsLookup)?
+                    .ok_or(ConnectingError::DnsNotFound)?;
+
+                (socket_address, domain.to_string())
+            }
+            Host::Ipv4(address) => {
+                let socket_address = SocketAddr::V4(SocketAddrV4::new(address, port));
+                (socket_address, address.to_string())
+            }
+            Host::Ipv6(address) => {
+                let socket_address = SocketAddr::V6(SocketAddrV6::new(address, port, 0, 0));
+                (socket_address, address.to_string())
+            }
+        };
+
+        let quic_connection = self
+            .endpoint
+            .connect(socket_address, &server_name)
+            .expect("QUIC connection parameters must be validated")
+            .await
+            .map_err(|connection_error| {
+                ConnectingError::ConnectionError(connection_error.into())
+            })?;
+
+        let driver = Driver::init(quic_connection.clone());
+
+        let _settings = driver.accept_settings().await.map_err(|driver_error| {
+            ConnectingError::ConnectionError(ConnectionError::with_driver_error(
+                driver_error,
+                &quic_connection,
+            ))
+        })?;
+
+        // TODO(biagio): validate settings
+
+        let mut session_request_proto =
+            SessionRequestProto::new(url.as_ref()).expect("Url has been already validate");
+        session_request_proto.set_header("authorization", authorization.to_string());
+
+        let mut stream_session = match driver.open_session(session_request_proto).await {
+            Ok(stream_session) => stream_session,
+            Err(driver_error) => {
+                return Err(ConnectingError::ConnectionError(
+                    ConnectionError::with_driver_error(driver_error, &quic_connection),
+                ))
+            }
+        };
+
+        let stream_id = stream_session.id();
+        let session_id = stream_session.session_id();
+
+        match stream_session
+            .write_frame(stream_session.request().headers().generate_frame(stream_id))
+            .await
+        {
+            Ok(()) => {}
+            Err(ProtoWriteError::Stopped) => {
+                return Err(ConnectingError::SessionRejected);
+            }
+            Err(ProtoWriteError::NotConnected) => {
+                return Err(ConnectingError::with_no_connection(&quic_connection));
+            }
+        }
+
+        let frame = match stream_session.read_frame().await {
+            Ok(frame) => frame,
+            Err(ProtoReadError::H3(error_code)) => {
+                quic_connection.close(varint_w2q(error_code.to_code()), b"");
+                return Err(ConnectingError::ConnectionError(
+                    ConnectionError::local_h3_error(error_code),
+                ));
+            }
+            Err(ProtoReadError::IO(_io_error)) => {
+                return Err(ConnectingError::with_no_connection(&quic_connection));
+            }
+        };
+
+        if !matches!(frame.kind(), FrameKind::Headers) {
+            quic_connection.close(varint_w2q(ErrorCode::FrameUnexpected.to_code()), b"");
+            return Err(ConnectingError::ConnectionError(
+                ConnectionError::local_h3_error(ErrorCode::FrameUnexpected),
+            ));
+        }
+
+        let headers = match Headers::with_frame(&frame, stream_id) {
+            Ok(headers) => headers,
+            Err(error_code) => {
+                quic_connection.close(varint_w2q(error_code.to_code()), b"");
+                return Err(ConnectingError::ConnectionError(
+                    ConnectionError::local_h3_error(error_code),
+                ));
+            }
+        };
+
+        let session_response = match SessionResponseProto::try_from(headers) {
+            Ok(session_response) => session_response,
+            Err(_) => {
+                quic_connection.close(varint_w2q(ErrorCode::Message.to_code()), b"");
+                return Err(ConnectingError::ConnectionError(
+                    ConnectionError::local_h3_error(ErrorCode::Message),
+                ));
+            }
+        };
+
+        if session_response.code().is_successful() {
+            match driver.register_session(stream_session).await {
+                Ok(()) => {}
+                Err(driver_error) => {
+                    return Err(ConnectingError::ConnectionError(
+                        ConnectionError::with_driver_error(driver_error, &quic_connection),
+                    ))
+                }
+            }
+        } else {
+            return Err(ConnectingError::SessionRejected);
+        }
+
+        Ok(Connection::new(quic_connection, driver, session_id))
+    }
 }
 
 type DynFutureIncomingSession =

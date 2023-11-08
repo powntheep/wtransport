@@ -112,6 +112,15 @@ impl SessionRequest {
         Ok(Self(headers))
     }
 
+    /// Adds a header field to the request.
+    pub fn set_header<K, V>(&mut self, key: K, value: V)
+    where
+        K: ToString,
+        V: ToString,
+    {
+        self.0.insert(key, value);
+    }
+
     /// Returns the `:authority` field of the request.
     pub fn authority(&self) -> &str {
         self.0
