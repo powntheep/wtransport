@@ -6,19 +6,22 @@ authors = ["Biagio Festa"]
 description = "Implementation of the WebTransport (over HTTP3) protocol"
 repository = "https://github.com/BiagioFesta/wtransport"
 keywords = ["webtransport"]
-categories = [ "network-programming", "asynchronous" ]
+categories = ["network-programming", "asynchronous"]
 edition = "2021"
 readme = "../README.md"
 workspace = ".."
 rust-version = "1.65.0"
 
 [dependencies]
-ls-qpack = "0.1.3"
+ls-qpack = { path = "../../ls-qpack-rs/ls-qpack" }
 octets = "0.2.0"
 url = "2.4.0"
 
 [dev-dependencies]
-tokio = { version = "1.28.1", default-features = false, features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1.28.1", default-features = false, features = [
+    "macros",
+    "rt-multi-thread",
+] }
 
 [features]
 default = []
